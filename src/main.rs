@@ -2,9 +2,14 @@ use clap::Parser;
 use nix::sys::uio::{pread, pwrite};
 use std::io;
 use std::io::Read;
+use std::path::Path;
 use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
 use std::thread;
-use std::{fs::File, path::PathBuf};
+use std::{
+    fs::{create_dir_all, File},
+    path::PathBuf,
+};
+use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "Parallel copy")]
@@ -18,6 +23,9 @@ struct Cli {
     out_file: PathBuf,
     #[arg(short, long, default_value_t = 10)]
     threads: u8,
+    #[arg(short, long)]
+    ///Copy all file in source directory to destination directory
+    recursive: bool,
     #[arg(short, long)]
     /// Verifies the copy completed successfully
     verify: bool,
@@ -63,52 +71,44 @@ fn verify_copy(
     Ok("Verified files are identical.".into())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let inf = cli.in_file;
-    let ouf = cli.out_file;
-    let num_threads = cli.threads as usize;
-
-    let infile = File::open(&inf).map_err(|e| match e.kind() {
+fn copy_file<P: AsRef<Path>>(
+    infile_path: P,
+    outfile_path: P,
+    num_threads: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let infile = File::open(infile_path.as_ref()).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => {
-            "The input file does not exist. Please check the file path and try again.".into()
+            format!(
+                "The input file {} does not exist. Please check the file path and try again.",
+                infile_path.as_ref().display()
+            )
         }
-        _ => format!("Failed to open input file: {}, {:?}", &inf.display(), e),
+        _ => format!(
+            "Failed to open input file: {}, {:?}",
+            infile_path.as_ref().display(),
+            e
+        ),
     })?;
 
-    let infile_size = infile
-        .metadata()
-        .map_err(|e| format!("Failed to get file size metadata: {:?}", e))?
-        .len() as usize;
+    let infile_size = infile.metadata()?.len() as usize;
 
-    eprintln!(
-        "Copying. Infile size: {}, with threads {}",
-        infile_size, num_threads
-    );
-
-    //Wrap infile in atomic reference counter.
-    let infile = Arc::new(infile);
-
-    //Set up output file
-    let outfile = File::create(&ouf).map_err(|e| {
+    let outfile = File::create(outfile_path.as_ref()).map_err(|e| {
         format!(
-            "Failed to produce output file '{}': {:?}",
-            &ouf.display(),
+            "Failed to create output file '{}': {:?}",
+            outfile_path.as_ref().display(),
             e
         )
     })?;
-
     outfile.set_len(infile_size as u64).unwrap();
-
-    let outfile = Arc::new(outfile);
 
     let mut threads = Vec::new();
     let slice = infile_size / num_threads;
-    let start_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
-
     let one_tenth_file_size = infile_size / 10;
-
     let processed_bytes = Arc::new(AtomicUsize::new(0));
+
+    //Wrap infiles in atomic reference counter.
+    let infile = Arc::new(infile);
+    let outfile = Arc::new(outfile);
 
     for thrd_num in 0..num_threads {
         let infile = Arc::clone(&infile);
@@ -135,28 +135,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprint!(
                         "\r[progress] {:.1}%",
                         (processed_bytes.load(Ordering::Relaxed) as f64 / infile_size as f64)
-                            * 100.0
+                            * 100.0,
                     );
                     local_processed = 0;
                 }
             }
         });
-
         threads.push(t);
     }
-
     for t in threads {
         t.join().unwrap();
     }
-    let finish_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
+    Ok(infile_size)
+}
+
+fn copy_dir_recursive(
+    src: &Path,
+    dest: &Path,
+    num_threads: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut total_bytes_copied = 0;
+    for entry in WalkDir::new(src) {
+        let entry = entry?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(src)?;
+        let dest_path = dest.join(relative_path);
+
+        if path.is_dir() {
+            create_dir_all(&dest_path)?;
+        } else {
+            let bytes_copied = copy_file(path, &dest_path, num_threads)?;
+            total_bytes_copied += bytes_copied;
+        }
+    }
+    Ok(total_bytes_copied)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let inf = cli.in_file;
+    let ouf = cli.out_file;
+    let num_threads = cli.threads as usize;
+
+    eprintln!("Copying data with threads {}", num_threads);
+
+    // do recursive dir walk here
+    let start_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
+
+    let (copy_size, finish_time) = (|| -> Result<(usize, f64), Box<dyn std::error::Error>> {
+        if !cli.recursive {
+            let copy_size = copy_file(&inf, &ouf, num_threads)?;
+            let finish_time =
+                time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
+            Ok((copy_size, finish_time))
+        } else {
+            let copy_size = copy_dir_recursive(&inf, &ouf, num_threads)?;
+            let finish_time =
+                time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
+            Ok((copy_size, finish_time))
+        }
+    })()?;
+
     eprintln!(
         "\n Copy finished. {} bytes written in {:.1} seconds = {:.3} Gbits/s",
-        infile_size,
+        copy_size,
         finish_time - start_time,
-        infile_size as f64 / (finish_time - start_time) * 8.0 / 1e9
+        copy_size as f64 / (finish_time - start_time) * 8.0 / 1e9
     );
-    if cli.verify {
-        match verify_copy(&inf, &ouf, infile_size) {
+
+    // varify only works for single file copy mode for now
+    if !cli.recursive & cli.verify {
+        match verify_copy(&inf, &ouf, copy_size) {
             Ok(msg) => eprintln!("{}", msg),
             Err(e) => {
                 eprintln!("File copy verification error: {}", e);
@@ -167,5 +216,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
     Ok(())
 }
