@@ -1,8 +1,8 @@
 use clap::Parser;
 use nix::sys::uio::{pread, pwrite};
-use std::env;
+use std::io;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
 use std::thread;
 use std::{fs::File, path::PathBuf};
 
@@ -10,32 +10,36 @@ use std::{fs::File, path::PathBuf};
 #[command(name = "Parallel copy")]
 #[command(author = "Matt S. <matt.storey@netvalue.nz>")]
 #[command(version = "0.1.0")]
-#[command(about = "Threaded copy of files", long_about = None)]
+#[command(about = "Threaded copying of files to steal bandwidth", long_about = None)]
 struct Cli {
-    #[arg(short)]
+    ///Source file path
     in_file: PathBuf,
-    #[arg(short)]
+    ///Destination file path
     out_file: PathBuf,
-    #[arg(default_value_t = 32)]
+    #[arg(short, long, default_value_t = 10)]
     threads: u8,
-    verify: Option<bool>,
+    #[arg(short, long)]
+    /// Verifies the copy completed successfully
+    verify: bool,
 }
 
-fn time_as_double() -> f64 {
+fn time_as_double() -> Result<f64, std::time::SystemTimeError> {
     // High precision time.
     let now = std::time::SystemTime::now();
-    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
-    since_epoch.as_secs_f64()
+    let since_epoch = now.duration_since(std::time::UNIX_EPOCH)?;
+    Ok(since_epoch.as_secs_f64())
 }
 
 fn verify_copy(
-    file1: &str,
-    file2: &str,
+    file1: &PathBuf,
+    file2: &PathBuf,
     file_size: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
     eprintln!(
         "Verifying '{}' and '{}' are the same after copy. Size {}",
-        file1, file2, file_size
+        file1.display(),
+        file2.display(),
+        file_size
     );
     let mut in1 = File::open(file1)?;
     let mut in2 = File::open(file2)?;
@@ -50,53 +54,61 @@ fn verify_copy(
 
         if bytes_read_from_file1 == bytes_read_from_file2 {
             if &buffer1[..bytes_read_from_file1] != &buffer2[..bytes_read_from_file2] {
-                return Err(format!("File differ at range starting {} bytes", step).into());
+                return Err(format!("File differ at range starting at {} bytes", step).into());
             }
         } else {
             eprintln!("*warning* uneven reads during varificaion");
         }
     }
-
-    Ok("Verified files are identical".into())
+    Ok("Verified files are identical.".into())
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let inf = cli.in_file;
+    let ouf = cli.out_file;
+    let num_threads = cli.threads as usize;
 
-    if args.len() < 3 {
-        eprintln!("Usage: {} <infile> <outfile> [num_threads]", args[0]);
-        std::process::exit(1);
-    }
-    let verify = true; // TODO: add arg parsing
+    let infile = File::open(&inf).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => {
+            "The input file does not exist. Please check the file path and try again.".into()
+        }
+        _ => format!("Failed to open input file: {}, {:?}", &inf.display(), e),
+    })?;
 
-    let inf = &args[1];
-    let ouf = &args[2];
-    let num_threads = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12);
+    let infile_size = infile
+        .metadata()
+        .map_err(|e| format!("Failed to get file size metadata: {:?}", e))?
+        .len() as usize;
 
-    let infile = File::open(inf).unwrap();
-    let infile_size = infile.metadata().unwrap().len() as usize;
     eprintln!(
         "Copying. Infile size: {}, with threads {}",
         infile_size, num_threads
     );
-    let infile = Arc::new(infile);
-    let outfile = File::create(ouf).unwrap();
-    outfile.set_len(infile_size as u64).unwrap();
-    // allocate_space(&outfile, infile_size)?;
-    // fallocate(file.as_raw_fd(), FallocateFlags::empty(), 0, length as i64)
 
-    // fn allocate_space(file: &File, length: u64) -> Result<(), nix::Error> {
-    //     fallocate(file.as_raw_fd(), FallocateFlags::empty(), 0, length as i64)
-    // }
+    //Wrap infile in atomic reference counter.
+    let infile = Arc::new(infile);
+
+    //Set up output file
+    let outfile = File::create(&ouf).map_err(|e| {
+        format!(
+            "Failed to produce output file '{}': {:?}",
+            &ouf.display(),
+            e
+        )
+    })?;
+
+    outfile.set_len(infile_size as u64).unwrap();
 
     let outfile = Arc::new(outfile);
 
     let mut threads = Vec::new();
     let slice = infile_size / num_threads;
-    let start_time = time_as_double();
+    let start_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
 
     let one_tenth_file_size = infile_size / 10;
-    let processed_bytes = Arc::new(Mutex::new(0usize));
+
+    let processed_bytes = Arc::new(AtomicUsize::new(0));
 
     for thrd_num in 0..num_threads {
         let infile = Arc::clone(&infile);
@@ -117,12 +129,13 @@ fn main() {
                 } else {
                     break;
                 }
+                // TODO: Dodgy progress bar -- needs work...
                 if local_processed >= one_tenth_file_size {
-                    let mut total_processed = processed_bytes.lock().unwrap();
-                    *total_processed += local_processed;
+                    processed_bytes.fetch_add(local_processed, Ordering::Relaxed);
                     eprint!(
                         "\r[progress] {:.1}%",
-                        (*total_processed as f64 / infile_size as f64) * 100.0
+                        (processed_bytes.load(Ordering::Relaxed) as f64 / infile_size as f64)
+                            * 100.0
                     );
                     local_processed = 0;
                 }
@@ -135,24 +148,24 @@ fn main() {
     for t in threads {
         t.join().unwrap();
     }
-    let finish_time = time_as_double();
+    let finish_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
     eprintln!(
-        "\n*info* Finished! {} bytes written in {:.1} seconds = {:.3} Gbits/s",
+        "\n Copy finished. {} bytes written in {:.1} seconds = {:.3} Gbits/s",
         infile_size,
         finish_time - start_time,
         infile_size as f64 / (finish_time - start_time) * 8.0 / 1e9
     );
-
-    if verify {
-        match verify_copy(inf, ouf, infile_size) {
+    if cli.verify {
+        match verify_copy(&inf, &ouf, infile_size) {
             Ok(msg) => eprintln!("{}", msg),
             Err(e) => {
                 eprintln!("File copy verification error: {}", e);
                 // Want to clean up file here but this might get run with sudo.
-                eprintln!("Go clean up the invalid copy at {}", ouf);
+                eprintln!("Go clean up the invalid copy at {}", ouf.display());
                 // Exit with a non-zero status code.
                 std::process::exit(1);
             }
         }
     }
+    Ok(())
 }
