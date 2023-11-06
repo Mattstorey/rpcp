@@ -1,8 +1,8 @@
 # RPCP (Recursive Parallel Copy)
 
 ## Description
-RPCP is a command-line tool designed for high-speed file copying, utilizing multiple threads to optimize bandwidth and transfer files quickly. It offers support for both individual files and recursive directory copying, with a focus on maximizing efficiency and throughput. This is still under development but works for the purpose of copying files and directories.  
-The tool slices the input file(s) into segments and leverages multi-threading to expedite file transfers copying each slice simultaneously. The number of threads determines how many slices the file is dived into, and users can balance speed against system resource consumption. As threads copy their respective segments, RPCP ensures synchronized writing to the destination, preserving the file's integrity and order.  
+RPCP is a command-line tool designed for high-speed file copying, utilizing multiple threads to optimize bandwidth and transfer files quickly. It offers support for both individual files and recursive directory copying, with a focus on maximizing efficiency and throughput. This is still under development but works for the purpose of copying files and directories where bandwidth can be increased by making parallel calls to the source device. This is generally useful for retrieving data from NAS devices.  
+The tool slices the input file(s) into segments and leverages multi-threading to expedite file transfers copying each slice simultaneously. The number of threads determines how many slices the file is divided into, and users can balance speed against system resource consumption. As threads copy their respective segments, RPCP ensures synchronized writing to the destination, preserving the file's integrity and order.  
 
 ## Features
 - **Multi-threaded Copying:** Accelerate the copy process by running multiple threads in parallel.
