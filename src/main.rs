@@ -89,7 +89,6 @@ fn copy_file<P: AsRef<Path>>(
             e
         ),
     })?;
-
     let infile_size = infile.metadata()?.len() as usize;
 
     let outfile = File::create(outfile_path.as_ref()).map_err(|e| {
@@ -103,8 +102,9 @@ fn copy_file<P: AsRef<Path>>(
 
     let mut threads = Vec::new();
     let slice = infile_size / num_threads;
-    let one_tenth_file_size = infile_size / 10;
     let processed_bytes = Arc::new(AtomicUsize::new(0));
+
+    eprintln!(" Copy {}", infile_path.as_ref().display());
 
     //Wrap infiles in atomic reference counter.
     let infile = Arc::new(infile);
@@ -118,34 +118,39 @@ fn copy_file<P: AsRef<Path>>(
         let t = thread::spawn(move || {
             let mut buffer = vec![0; 1024 * 1024];
             let mut pos = thrd_num * slice;
-            let mut local_processed = 0usize;
 
             while pos < (thrd_num + 1) * slice {
                 let size_bytes_read = pread(&*infile, &mut buffer, pos as i64).unwrap();
                 if size_bytes_read > 0 {
                     pwrite(&*outfile, &buffer[..size_bytes_read], pos as i64).unwrap();
                     pos += size_bytes_read;
-                    local_processed += size_bytes_read;
+                    processed_bytes.fetch_add(size_bytes_read, Ordering::SeqCst);
                 } else {
                     break;
-                }
-                // TODO: Dodgy progress bar -- needs work...
-                if local_processed >= one_tenth_file_size {
-                    processed_bytes.fetch_add(local_processed, Ordering::Relaxed);
-                    eprint!(
-                        "\r[progress] {:.1}%",
-                        (processed_bytes.load(Ordering::Relaxed) as f64 / infile_size as f64)
-                            * 100.0,
-                    );
-                    local_processed = 0;
                 }
             }
         });
         threads.push(t);
     }
+
+    // Progress monitoring thread
+    let progress_clone = Arc::clone(&processed_bytes);
+
+    let monitor_handle = thread::spawn(move || {
+        while progress_clone.load(Ordering::SeqCst) < infile_size {
+            let pct_prgrs =
+                (progress_clone.load(Ordering::SeqCst) as f64 / infile_size as f64) * 100.;
+            eprint!("\rProgress: {pct_prgrs:.1}%",);
+            thread::sleep(std::time::Duration::from_millis(50)); // Update every .25 second
+        }
+        eprint!("\rProgress: 100.0%",);
+    });
+
     for t in threads {
         t.join().unwrap();
     }
+
+    monitor_handle.join().unwrap();
     Ok(infile_size)
 }
 
@@ -160,7 +165,7 @@ fn copy_dir_recursive(
         let path = entry.path();
         let relative_path = path.strip_prefix(src)?;
         let dest_path = dest.join(relative_path);
-
+        eprint!("\r");
         if path.is_dir() {
             create_dir_all(&dest_path)?;
         } else {
@@ -177,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ouf = cli.out_file;
     let num_threads = cli.threads as usize;
 
-    eprintln!("Copying data with threads {}", num_threads);
+    eprintln!("Copying data with {} threads", num_threads);
 
     // do recursive dir walk here
     let start_time = time_as_double().map_err(|e| format!("Error calculating time: {:?}", e))?;
