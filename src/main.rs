@@ -76,6 +76,7 @@ fn copy_file<P: AsRef<Path>>(
     outfile_path: P,
     num_threads: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut num_threads = num_threads;
     let infile = File::open(infile_path.as_ref()).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => {
             format!(
@@ -91,6 +92,10 @@ fn copy_file<P: AsRef<Path>>(
     })?;
     let infile_size = infile.metadata()?.len() as usize;
 
+    if infile_size < 1 * 1024 * 1024 {
+        eprintln!("Samll file. Copy with one thread");
+        num_threads = 1
+    };
     let outfile = File::create(outfile_path.as_ref()).map_err(|e| {
         format!(
             "Failed to create output file '{}': {:?}",
